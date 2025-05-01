@@ -5,7 +5,10 @@ from google import genai
 from google.genai import types
 import asyncio
 from pathlib import Path
-
+from rich import print
+from rich.progress import Progress
+from rich.console import Console
+from art import * 
 load_dotenv()
 
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -35,86 +38,98 @@ def compress_video(input_path: str, output_path: str) -> str:
 
 
 async def index_video(video_path: str):
-    print(f"Indexing video: {video_path}")
+    with Progress() as progress:
+        # Create tasks for different stages
+        compression_task = progress.add_task("[cyan]Compressing video...", total=100)
+        processing_task = progress.add_task("[green]Processing with Gemini...", total=100)
+        
+        # Compress video first
+        compressed_path = video_path.replace(".mp4", "_compressed.mp4")
+        try:
+            compressed_path = compress_video(video_path, compressed_path)
+            progress.update(compression_task, completed=100)
+        except Exception as e:
+            print(f"Warning: Could not compress video: {e}")
+            compressed_path = video_path  # Fallback to original if compression fails
+            progress.update(compression_task, completed=100)
 
-    # Compress video first
-    compressed_path = video_path.replace(".mp4", "_compressed.mp4")
-    try:
-        compressed_path = compress_video(video_path, compressed_path)
-    except Exception as e:
-        print(f"Warning: Could not compress video: {e}")
-        compressed_path = video_path  # Fallback to original if compression fails
-
-    try:
-        video_bytes = open(compressed_path, "rb").read()
-        prompt = """
-        Every time there is a new scene detected, please provide a summary of the scene in 3 sentences. also give a timestamps of the scene.
-        """
-        response = gemini_client.models.generate_content(
-            model="models/gemini-2.0-flash",
-            contents=types.Content(
-                parts=[
-                    types.Part(
-                        inline_data=types.Blob(data=video_bytes, mime_type="video/mp4")
-                    ),
-                    types.Part(text=prompt),
-                ]
-            ),
-        )
-        summary_path = os.path.join(
-            "outputs", "summary", f"{os.path.basename(video_path)}.txt"
-        )
-        os.makedirs(os.path.dirname(summary_path), exist_ok=True)
-        with open(summary_path, "w") as f:
-            f.write(response.text)
-        return response.text
-    finally:
-        # Clean up compressed file if it was created
-        if compressed_path != video_path and os.path.exists(compressed_path):
-            os.remove(compressed_path)
+        try:
+            video_bytes = open(compressed_path, "rb").read()
+            prompt = """
+            Every time there is a new scene detected, please provide a summary of the scene in 3 sentences. also give a timestamps of the scene.
+            """
+            response = gemini_client.models.generate_content(
+                model="models/gemini-2.0-flash",
+                contents=types.Content(
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(data=video_bytes, mime_type="video/mp4")
+                        ),
+                        types.Part(text=prompt),
+                    ]
+                ),
+            )
+            progress.update(processing_task, completed=100)
+            
+            summary_path = os.path.join(
+                "outputs", "summary", f"{os.path.basename(video_path)}.txt"
+            )
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            with open(summary_path, "w") as f:
+                f.write(response.text)
+            return response.text
+        finally:
+            # Clean up compressed file if it was created
+            if compressed_path != video_path and os.path.exists(compressed_path):
+                os.remove(compressed_path)
 
 
 async def extract_audio(video_path: str):
-    print(f"Indexing video: {video_path}")
+    with Progress() as progress:
+        # Create tasks for different stages
+        extraction_task = progress.add_task("[cyan]Extracting audio...", total=100)
+        transcription_task = progress.add_task("[green]Transcribing audio...", total=100)
 
-    output_path = os.path.join(
-        "outputs", "audio", f"{os.path.basename(video_path)}.mp3"
-    )
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    try:
-        extract_audio_command = subprocess.run(
-            ["ffmpeg", "-i", video_path, "-q:a", "0", "-map", "a", output_path],
-            capture_output=True,
-            text=True,
+        output_path = os.path.join(
+            "outputs", "audio", f"{os.path.basename(video_path)}.mp3"
         )
-        if extract_audio_command.returncode != 0:
-            raise Exception(f"Failed to extract audio: {extract_audio_command.stderr}")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        with open(output_path, "rb") as f:
-            audio_bytes = f.read()
+        try:
+            extract_audio_command = subprocess.run(
+                ["ffmpeg", "-i", video_path, "-q:a", "0", "-map", "a", output_path],
+                capture_output=True,
+                text=True,
+            )
+            if extract_audio_command.returncode != 0:
+                raise Exception(f"Failed to extract audio: {extract_audio_command.stderr}")
+            progress.update(extraction_task, completed=100)
 
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
-                "generate a transcript of the audio",
-                types.Part.from_bytes(
-                    data=audio_bytes,
-                    mime_type="audio/mp3",
-                ),
-            ],
-        )
+            with open(output_path, "rb") as f:
+                audio_bytes = f.read()
 
-        transcript_path = os.path.join(
-            "outputs", "transcript", f"{os.path.basename(video_path)}.txt"
-        )
-        os.makedirs(os.path.dirname(transcript_path), exist_ok=True)
-        with open(transcript_path, "w") as f:
-            f.write(response.text)
-        return transcript_path
-    except Exception as e:
-        print(f"Error in audio processing: {e}")
-        raise
+            response = gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[
+                    "generate a transcript of the audio",
+                    types.Part.from_bytes(
+                        data=audio_bytes,
+                        mime_type="audio/mp3",
+                    ),
+                ],
+            )
+            progress.update(transcription_task, completed=100)
+
+            transcript_path = os.path.join(
+                "outputs", "transcript", f"{os.path.basename(video_path)}.txt"
+            )
+            os.makedirs(os.path.dirname(transcript_path), exist_ok=True)
+            with open(transcript_path, "w") as f:
+                f.write(response.text)
+            return transcript_path
+        except Exception as e:
+            print(f"Error in audio processing: {e}")
+            raise
 
 
 def validate_video_path(video_path: str) -> str:
@@ -146,8 +161,10 @@ def validate_video_path(video_path: str) -> str:
     return str(abs_path)
 
 
+
 async def main():
-    print("Welcome to Reduct CLI")
+    # tprint("Reduct CLI", font="broadway")
+    print(art("cute_face"), "[bold purple]Welcome to Reduct CLI[/bold purple]", (art("cute_face")))
     while True:
         try:
             video_path = input("Enter the video path: ")
@@ -157,7 +174,7 @@ async def main():
             print(f"Error: {e}")
             print("Please try again with a valid video path.")
             continue
-
+    
     # Create necessary directories
     os.makedirs("outputs/summary", exist_ok=True)
     os.makedirs("outputs/audio", exist_ok=True)
@@ -171,6 +188,10 @@ async def main():
         # Wait for both tasks to complete
         await asyncio.gather(video_task, audio_task)
 
+        # with yaspin.yaspin(text="Processing", color="cyan") as spinner:
+        #         time.sleep(2)
+        #         spinner.ok("✅")
+                
         print("Processing complete!")
         print("Find your summary in the `outputs/summary` directory")
         print("Find your transcript in the `outputs/transcript` directory")
