@@ -4,7 +4,6 @@ import subprocess
 from google import genai
 from google.genai import types
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -124,8 +123,7 @@ async def extract_audio(video_path: str):
 
 async def main():
     print("Welcome to Reduct CLI")
-    print("Before we begin, make sure you have a video file in the `temp` directory")
-    video_path = input("Enter the video path: ")
+    video_path = input("Enter the video path, make sure it's the entire path: ")
 
     # Create necessary directories
     os.makedirs("outputs/summary", exist_ok=True)
@@ -144,11 +142,6 @@ async def main():
         print("Find your summary in the `outputs/summary` directory")
         print("Find your transcript in the `outputs/transcript` directory")
 
-        # Clean up
-        temp_video_path = os.path.join("temp", video_path)
-        if os.path.exists(temp_video_path):
-            os.remove(temp_video_path)
-            print("Original video file deleted from temp directory")
 
     except Exception as e:
         print(f"An error occurred: {e}")
