@@ -4,6 +4,7 @@ import subprocess
 from google import genai
 from google.genai import types
 import asyncio
+from pathlib import Path
 
 load_dotenv()
 
@@ -23,7 +24,8 @@ def compress_video(input_path: str, output_path: str) -> str:
         "-crf",
         "23",  # Good quality compression
         "-preset",
-        "medium",
+        "fast",  # Change from "medium" to "fast" for better speed
+        "-y",    # Add -y to overwrite without asking
         output_path,
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -33,10 +35,6 @@ def compress_video(input_path: str, output_path: str) -> str:
 
 
 async def index_video(video_path: str):
-    video_path = os.path.join("temp", video_path)
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-
     print(f"Indexing video: {video_path}")
 
     # Compress video first
@@ -77,9 +75,7 @@ async def index_video(video_path: str):
 
 
 async def extract_audio(video_path: str):
-    video_path = os.path.join("temp", video_path)
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video file not found: {video_path}")
+    print(f"Indexing video: {video_path}")
 
     output_path = os.path.join(
         "outputs", "audio", f"{os.path.basename(video_path)}.mp3"
@@ -121,9 +117,46 @@ async def extract_audio(video_path: str):
         raise
 
 
+def validate_video_path(video_path: str) -> str:
+    """
+    Validate and normalize the video path.
+    Returns the absolute path if valid, raises an exception otherwise.
+    """
+    # Strip quotes from the path if present
+    video_path = video_path.strip("'\"")
+    
+    # Convert to Path object for better handling
+    path = Path(video_path)
+    
+    # Convert to absolute path
+    abs_path = path.absolute()
+    
+    # Check if file exists
+    if not abs_path.exists():
+        raise FileNotFoundError(f"Video file not found at: {abs_path}")
+    
+    # Check if it's a file
+    if not abs_path.is_file():
+        raise ValueError(f"Path is not a file: {abs_path}")
+    
+    # Check if it's a video file (basic check)
+    if not abs_path.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv', '.wmv']:
+        raise ValueError(f"File is not a supported video format: {abs_path}")
+    
+    return str(abs_path)
+
+
 async def main():
     print("Welcome to Reduct CLI")
-    video_path = input("Enter the video path, make sure it's the entire path: ")
+    while True:
+        try:
+            video_path = input("Enter the video path: ")
+            video_path = validate_video_path(video_path)
+            break
+        except (FileNotFoundError, ValueError) as e:
+            print(f"Error: {e}")
+            print("Please try again with a valid video path.")
+            continue
 
     # Create necessary directories
     os.makedirs("outputs/summary", exist_ok=True)
@@ -141,7 +174,6 @@ async def main():
         print("Processing complete!")
         print("Find your summary in the `outputs/summary` directory")
         print("Find your transcript in the `outputs/transcript` directory")
-
 
     except Exception as e:
         print(f"An error occurred: {e}")
