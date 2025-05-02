@@ -1,4 +1,11 @@
 # todo
+
+add to video editing
+- [x] ask user for input and use that to edit video
+- [ ] hold memory of the ai inputs 
+- [ ] merging videos
+- [ ] cutting 2 videos and then merging videos
+
 add to video indexing
 - [ ] categorizing video content into: 
     - [x] categorize scenes 
