@@ -5,13 +5,11 @@ from google import genai
 import asyncio
 from pathlib import Path
 from rich import print
-from rich.console import Console
 from art import * 
 from openai import OpenAI
 load_dotenv()
 
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 def get_unique_file_path(base_path: str) -> str:
