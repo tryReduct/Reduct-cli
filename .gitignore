@@ -104,6 +104,8 @@ venv.bak/
 *.swp
 *.swo
 
+broll_sample.mp4
+
 # OS
 .DS_Store
 Thumbs.db
