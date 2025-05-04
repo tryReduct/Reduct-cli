@@ -3,16 +3,34 @@ import json
 import os
 from pathlib import Path
 from utils.video_index import compress_video,analyze_video
+from utils.analyze_video_frames import analyze_video_frames
+from utils.audio_extract import extract_audio
+from utils.audio_index import index_audio
 from google import genai
 import asyncio
 from pathlib import Path
 from rich import print
 from art import * 
 from dotenv import load_dotenv
+from typing import Dict, List, Optional
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+def setup_output_directories():
+    """Create all necessary output directories if they don't exist."""
+    base_dir = os.path.join("src", "outputs")
+    directories = [
+        os.path.join(base_dir, "metadata"),
+        os.path.join(base_dir, "ffmpeg_commands"),
+        os.path.join(base_dir, "edited"),
+        os.path.join(base_dir, "compressed"),
+        os.path.join(base_dir, "audio"),
+        os.path.join(base_dir, "frames")
+    ]
+    for directory in directories:
+        os.makedirs(directory, exist_ok=True)
+        print(f"[green]Ensured directory exists: {directory}[/green]")
 
 def get_unique_file_path(base_path: str) -> str:
     """
@@ -69,7 +87,7 @@ def validate_video_path(video_path: str) -> str:
 async def clean_user_prompt(prompt: str) -> str:
     try:
         USER_REQUEST = prompt.strip()
-        SYSTEM_PROMPT = Path('prompts/clean_user_prompt.txt').read_text(encoding='utf-8')
+        SYSTEM_PROMPT = Path('src/prompts/clean_user_prompt.txt').read_text(encoding='utf-8')
         response = gemini_client.models.generate_content(
             model="models/gemini-2.0-flash",
             contents=[
@@ -79,7 +97,7 @@ async def clean_user_prompt(prompt: str) -> str:
                 '''
             ],
         )
-        os.makedirs('outputs/metadata', exist_ok=True)
+        os.makedirs('src/outputs/metadata', exist_ok=True)
         
         # Clean the response text to ensure it's valid JSON
         response_text = response.text.strip()
@@ -92,7 +110,7 @@ async def clean_user_prompt(prompt: str) -> str:
         # Parse and re-serialize to ensure clean JSON
         try:
             json_data = json.loads(response_text)
-            with open('outputs/metadata/CLEAN_REQUEST.json', 'w', encoding='utf-8') as f:
+            with open('src/outputs/metadata/CLEAN_REQUEST.json', 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, indent=2, ensure_ascii=False)
             return response_text
         except json.JSONDecodeError as e:
@@ -103,8 +121,8 @@ async def clean_user_prompt(prompt: str) -> str:
 async def generate_ffmpeg_command(video_path: str):
     try:
         # Read and parse JSON files
-        video_metadata_path = Path('outputs/metadata/VIDEO_METADATA.json')
-        clean_request_path = Path('outputs/metadata/CLEAN_REQUEST.json')
+        video_metadata_path = Path('src/outputs/metadata/VIDEO_METADATA.json')
+        clean_request_path = Path('src/outputs/metadata/CLEAN_REQUEST.json')
         
         if not video_metadata_path.exists() or not clean_request_path.exists():
             raise FileNotFoundError("Required metadata files not found")
@@ -120,15 +138,15 @@ async def generate_ffmpeg_command(video_path: str):
         
         # Get the compressed video path and output path
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-        compressed_path = os.path.join("outputs", "compressed", f"{base_name}_compressed.mp4")
-        output_path = os.path.join("outputs", "edited", f"{base_name}_edited.mp4")
+        compressed_path = os.path.join("src", "outputs", "compressed", f"{base_name}_compressed.mp4")
+        output_path = os.path.join("src", "outputs", "edited", f"{base_name}_edited.mp4")
         
         # Ensure the compressed video exists
         if not os.path.exists(compressed_path):
             raise FileNotFoundError(f"Compressed video not found at: {compressed_path}")
         
         # Read the system prompt and replace placeholders
-        system_prompt = Path('prompts/generate_ffmpeg_command.txt').read_text(encoding='utf-8')
+        system_prompt = Path('src/prompts/generate_ffmpeg_command.txt').read_text(encoding='utf-8')
         system_prompt = system_prompt.replace('"input.mp4"', f'"{compressed_path}"')
         system_prompt = system_prompt.replace('"output.mp4"', f'"{output_path}"')
         
@@ -173,39 +191,78 @@ async def generate_ffmpeg_command(video_path: str):
                 command_text = parts[0] + '-filter_complex ' + filter_part
         
         # Save the cleaned command
-        os.makedirs('outputs/ffmpeg_commands', exist_ok=True)
-        with open('outputs/ffmpeg_commands/FFMPEG_COMMAND.txt', 'w', encoding='utf-8') as f:
+        os.makedirs('src/outputs/ffmpeg_commands', exist_ok=True)
+        with open('src/outputs/ffmpeg_commands/FFMPEG_COMMAND.txt', 'w', encoding='utf-8') as f:
             f.write(command_text)
         return command_text
     except Exception as e:
         raise Exception(f"Failed to generate ffmpeg command: {str(e)}")
 
 
+async def load_metadata(video_path: str) -> Dict:
+    """Load and combine all available metadata for the video."""
+    try:
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        metadata = {
+            "audio": None,
+            "frames": None,
+            "video_info": None
+        }
+        
+        # Load audio analysis
+        audio_path = os.path.join("src", "outputs", "audio", f"{base_name}_audio_index.json")
+        if os.path.exists(audio_path):
+            with open(audio_path, 'r') as f:
+                metadata["audio"] = json.load(f)
+        
+        # Load frame analysis
+        frames_path = os.path.join("src", "outputs", "frames", base_name, "gemini_analysis.json")
+        if os.path.exists(frames_path):
+            with open(frames_path, 'r') as f:
+                metadata["frames"] = json.load(f)
+        
+        # Get video information using ffprobe
+        video_info_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration,size,bit_rate:stream=width,height,r_frame_rate,codec_name",
+            "-of", "json",
+            video_path
+        ]
+        result = subprocess.run(video_info_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            metadata["video_info"] = json.loads(result.stdout)
+        
+        return metadata
+    except Exception as e:
+        print(f"[yellow]Warning: Failed to load metadata: {str(e)}[/yellow]")
+        return {}
+
 async def edit_video(video_path: str):
     try:
-        # Read and clean the command
-        command_path = Path('outputs/ffmpeg_commands/FFMPEG_COMMAND.txt')
+        # Load all available metadata
+        metadata = await load_metadata(video_path)
+        
+        # Read the FFmpeg command
+        command_path = Path('src/outputs/ffmpeg_commands/FFMPEG_COMMAND.txt')
         if not command_path.exists():
             raise FileNotFoundError("FFmpeg command file not found")
             
-        FFMPEG_COMMAND = command_path.read_text(encoding='utf-8').strip()
+        ffmpeg_command = command_path.read_text(encoding='utf-8').strip()
         
-        # Clean the command again in case it was saved with markers
-        if FFMPEG_COMMAND.startswith('```bash'):
-            FFMPEG_COMMAND = FFMPEG_COMMAND[7:]
-        if FFMPEG_COMMAND.endswith('```'):
-            FFMPEG_COMMAND = FFMPEG_COMMAND[:-3]
-        FFMPEG_COMMAND = FFMPEG_COMMAND.strip()
-        
-        # Create edited output directory if it doesn't exist
-        os.makedirs("outputs/edited", exist_ok=True)
+        # Clean the command in case it was saved with markers
+        if ffmpeg_command.startswith('```bash'):
+            ffmpeg_command = ffmpeg_command[7:]
+        if ffmpeg_command.endswith('```'):
+            ffmpeg_command = ffmpeg_command[:-3]
+        ffmpeg_command = ffmpeg_command.strip()
         
         # Split the command into parts, handling filter_complex specially
         command_parts = []
         current_part = []
         in_filter = False
         
-        for part in FFMPEG_COMMAND.split():
+        for part in ffmpeg_command.split():
             if part == '-filter_complex':
                 in_filter = True
                 if current_part:
@@ -226,18 +283,19 @@ async def edit_video(video_path: str):
             command_parts.append(' '.join(current_part))
         
         # Execute the command
-        result = subprocess.run(command_parts, capture_output=True, text=True)
+        print(f"[cyan]Executing FFmpeg command: {' '.join(command_parts)}[/cyan]")
+        result = await asyncio.to_thread(subprocess.run, command_parts, capture_output=True, text=True)
+        
         if result.returncode != 0:
             raise Exception(f"FFmpeg command failed: {result.stderr}")
             
         # Get the output file path
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-        output_path = os.path.join("outputs", "edited", f"{base_name}_edited.mp4")
+        output_path = os.path.join("src", "outputs", "edited", f"{base_name}_edited.mp4")
         
         if not os.path.exists(output_path):
             raise Exception(f"Edited video was not created at: {output_path}")
             
-        print(f"Video edited successfully and saved to: {output_path}")
         return output_path
     except Exception as e:
         raise Exception(f"Failed to edit video: {str(e)}")
@@ -256,25 +314,82 @@ async def main():
                 continue
         
         try:
-            # Create necessary directories
-            os.makedirs("outputs/metadata", exist_ok=True)
-            os.makedirs("outputs/ffmpeg_commands", exist_ok=True)
-            os.makedirs("outputs/edited", exist_ok=True)
+            # Setup all necessary directories
+            setup_output_directories()
             
-            # Run both processes concurrently
-            video_task = asyncio.create_task(compress_video(video_path))
-            await analyze_video(video_path)
-
-            # Wait for both tasks to complete
-            await asyncio.gather(video_task)
-            print("Processing complete!\n How do you want to edit the video?: ")
+            print("[cyan]Starting video processing...[/cyan]")
+            
+            # First compress the video
+            print("[cyan]Compressing video...[/cyan]")
+            compressed_video_path = await compress_video(video_path)
+            print(f"[green]Video compressed successfully to: {compressed_video_path}[/green]")
+            
+            # Run video analysis and frame analysis concurrently with timeouts
+            print("[cyan]Analyzing video and frames...[/cyan]")
+            try:
+                video_analysis_task = asyncio.create_task(analyze_video(video_path))
+                # frame_analysis_task = asyncio.create_task(analyze_video_frames(video_path))
+                
+                # Wait for both tasks with a timeout
+                done, pending = await asyncio.wait(
+                    # [video_analysis_task, frame_analysis_task],
+                    [video_analysis_task],
+                    timeout=600,  # 10 minutes timeout
+                    return_when=asyncio.ALL_COMPLETED
+                )
+                
+                # Check for timeouts
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    raise Exception("Analysis tasks timed out after 10 minutes")
+                
+                # Check for exceptions
+                for task in done:
+                    if task.exception():
+                        raise task.exception()
+                
+                print("[green]Video and frame analysis completed successfully[/green]")
+                
+            except asyncio.TimeoutError:
+                raise Exception("Analysis tasks timed out after 10 minutes")
+            except Exception as e:
+                raise Exception(f"Analysis failed: {str(e)}")
+            
+            # Extract and index audio
+            print("[cyan]Processing audio...[/cyan]")
+            try:
+                audio_path = await extract_audio(video_path, os.path.join("src", "outputs", "audio"))
+                print(f"[green]Audio extracted successfully to: {audio_path}[/green]")
+                
+                # Index the audio after extraction is complete
+                await index_audio(audio_path)
+                print("[green]Audio indexing completed[/green]")
+            except Exception as e:
+                raise Exception(f"Audio processing failed: {str(e)}")
+            
+            # Get user's edit prompt
+            print("\n[bold]How do you want to edit the video?[/bold]")
             prompt = input("Enter your prompt: ")
-            await clean_user_prompt(prompt)
-            await generate_ffmpeg_command(video_path)
-            print("Edit command generated successfully")
+            
+            # Process the prompt and generate edit command
+            print("[cyan]Processing edit request...[/cyan]")
+            try:
+                await clean_user_prompt(prompt)
+                ffmpeg_command = await generate_ffmpeg_command(video_path)
+                
+                # Execute the edit command
+                print("[cyan]Applying edits to video...[/cyan]")
+                edited_video_path = await edit_video(video_path)
+                print(f"[green]Video edited successfully and saved to: {edited_video_path}[/green]")
+            except Exception as e:
+                raise Exception(f"Edit processing failed: {str(e)}")
+            
+            print("\n[bold green]All processing completed successfully![/bold green]")
             break
+            
         except Exception as e:
-            print(f"An error occurred: {e}")
+            print(f"[red]An error occurred: {e}[/red]")
             print("Please try again or contact support if the issue persists.")
             break
 
