@@ -72,7 +72,7 @@ def search_video(user_query):
 
 if __name__ == "__main__":
     while True:
-        print("\nWelcome to Reduct")
+        print("\nWelcome to Reduct\n")
         print("1. Upload a video")
         print("2. Search in your video library")
         print("3. Exit")
