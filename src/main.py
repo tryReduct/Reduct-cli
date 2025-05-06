@@ -3,8 +3,6 @@ from glob import glob
 from twelvelabs.models.task import Task
 import os
 from google import genai
-from fastapi import FastAPI
-import uvicorn
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
