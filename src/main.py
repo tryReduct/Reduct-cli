@@ -2,10 +2,15 @@ import os
 import json
 import argparse
 from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import subprocess
+from pymongo import MongoClient
 from pathlib import Path
 import shutil
+import sys
+import asyncio
+from dataclasses import dataclass
+from enum import Enum
 
 from twelve import upload_video, client, INDEX_ID, search_video
 from process_results import ClipProcessor
@@ -17,6 +22,25 @@ from dotenv import load_dotenv
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+db_client = MongoClient(os.getenv("MONGO_URI"))
+db = db_client["Reduct"]
+
+
+class VideoStatus(Enum):
+    PENDING = "pending"
+    UPLOADING = "uploading"
+    INDEXING = "indexing"
+    READY = "ready"
+    ERROR = "error"
+
+
+@dataclass
+class VideoMetadata:
+    path: str
+    task_id: Optional[str]
+    status: VideoStatus
+    error: Optional[str] = None
+
 
 class VideoEditor:
     def __init__(self):
@@ -24,164 +48,93 @@ class VideoEditor:
         self.output_dir = Path("src/edited/videos")
         self.temp_dir = Path("src/temp")
         self.clips_dir = self.temp_dir / "clips"
-        
+        self.video_metadata: Dict[str, VideoMetadata] = {}
+
         # Create necessary directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.clips_dir.mkdir(parents=True, exist_ok=True)
 
-    def _create_clip(self, video_id: str, start_time: float, end_time: float, clip_index: int) -> str:
-        """Create a clip from the original video file using FFmpeg."""
+    async def upload_video_async(self, path: str) -> None:
+        """Asynchronously upload and index a video."""
         try:
-            # Get video info using SDK
-            video = client.video.get(video_id)
-            if not video or not video.url:
-                print(f"Warning: Could not get video info for {video_id}")
-                return None
+            self.video_metadata[path] = VideoMetadata(
+                path=path, task_id=None, status=VideoStatus.UPLOADING
+            )
+            task_id = await upload_video(path)
+            self.video_metadata[path].task_id = task_id
+            self.video_metadata[path].status = VideoStatus.INDEXING
 
-            output_path = self.clips_dir / f"clip_{clip_index}.mp4"
-            
-            # FFmpeg command to cut the clip
-            command = f'ffmpeg -y -ss {start_time} -to {end_time} -i "{video.url}" -c copy "{output_path}"'
-            
-            try:
-                result = subprocess.run(command, shell=True, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"Error creating clip: {result.stderr}")
-                    return None
-                return str(output_path)
-            except Exception as e:
-                print(f"Error creating clip: {str(e)}")
-                return None
+            # Wait for indexing to complete
+            while True:
+                status = await client.task.get(task_id)
+                if status.status == "completed":
+                    self.video_metadata[path].status = VideoStatus.READY
+                    break
+                elif status.status == "failed":
+                    self.video_metadata[path].status = VideoStatus.ERROR
+                    self.video_metadata[path].error = status.error
+                    break
+                await asyncio.sleep(5)
         except Exception as e:
-            print(f"Error creating clip: {str(e)}")
-            return None
+            self.video_metadata[path].status = VideoStatus.ERROR
+            self.video_metadata[path].error = str(e)
 
-    def _create_concat_file(self, clip_paths: List[str]) -> str:
-        """Create a file listing clips for FFmpeg concatenation."""
-        concat_file = self.temp_dir / "concat_list.txt"
-        with open(concat_file, 'w') as f:
-            for path in clip_paths:
-                f.write(f"file '{path}'\n")
-        return str(concat_file)
-
-    def analyze_prompt(self, prompt: str) -> Tuple[str, str]:
-        """First Gemini call to analyze prompt and extract search terms and edit type."""
+    def analyze_prompt(self, prompt: str) -> Dict:
+        """First Gemini call to analyze prompt and extract structured information."""
         analysis_prompt = f"""
-        Analyze the following video editing prompt and extract:
-        1. Search terms to find relevant video clips
-        2. Type of edit the user wants to perform (e.g., cut, merge, add transition)
-
-        Prompt: {prompt}
-
-        Return the response in JSON format with keys 'search_terms' and 'edit_type'.
+        You are an AI assistant that helps understand video editing requests.
+        The user wants to edit videos. Their request is: "{prompt}"
+        Based on this request, identify the core concepts, objects, actions, spoken phrases, or text-on-screen the user is looking for.
+        Formulate a concise and effective search query (or multiple queries if necessary) that can be used with a semantic video search API (like Twelvelabs) to find relevant segments in the indexed videos.
+        Also, identify any specific editing actions requested (e.g., cut, join, add text, speed up).
+        Output: A JSON object with 'search_queries': ["query1", "query2"], 'editing_actions': ["action1", "action2"], 'target_videos': ["video1.mp4" or "all_indexed_videos"]
         """
-        
+
         response = gemini_client.models.generate_content(
-            model='gemini-2.0-flash',
+            model="gemini-2.0-flash",
             contents=[analysis_prompt],
         )
         try:
-            analysis = json.loads(response.text)
-            return analysis['search_terms'], analysis['edit_type']
+            return json.loads(response.text)
         except:
             # Fallback to simple extraction if JSON parsing fails
-            return prompt, "cut"  # Default to cut if analysis fails
+            return {
+                "search_queries": [prompt],
+                "editing_actions": ["cut"],
+                "target_videos": ["all_indexed_videos"],
+            }
 
-    def generate_ffmpeg_command(self, prompt: str, clips: List[Dict], edit_type: str) -> Tuple[str, List[str]]:
-        """Generate FFmpeg command using Gemini and create necessary clips."""
-        # First, create all the clips
-        clip_paths = []
-        for i, clip in enumerate(clips):
-            clip_path = self._create_clip(
-                clip['video_id'],
-                clip['start_time'],
-                clip['end_time'],
-                i
-            )
-            if clip_path:
-                clip_paths.append(clip_path)
-        
-        if not clip_paths:
-            raise ValueError("Failed to create any clips")
-
-        # Create concat file
-        concat_file = self._create_concat_file(clip_paths)
-        
-        # Generate final FFmpeg command
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = self.output_dir / f"edited_{timestamp}.mp4"
-        
-        # Generate a simple concat command
-        command = f'ffmpeg -y -f concat -safe 0 -i "{concat_file}" -c copy "{output_path}"'
-        
-        return command, clip_paths
-
-    def execute_ffmpeg(self, command: str, output_path: str) -> bool:
-        """Execute FFmpeg command with error handling."""
-        try:
-            # Validate command for safety
-            if not command.startswith('ffmpeg'):
-                raise ValueError("Invalid FFmpeg command")
-            
-            # Execute command
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                print(f"FFmpeg error: {result.stderr}")
-                return False
-                
-            return True
-            
-        except Exception as e:
-            print(f"Error executing FFmpeg command: {str(e)}")
-            return False
-
-    def cleanup(self, clip_paths: List[str]):
-        """Clean up temporary files."""
-        try:
-            # Remove individual clips
-            for path in clip_paths:
-                if os.path.exists(path):
-                    os.remove(path)
-            
-            # Remove concat file
-            concat_file = self.temp_dir / "concat_list.txt"
-            if concat_file.exists():
-                os.remove(concat_file)
-                
-        except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
-
-    def process_edit(self, prompt: str, video_paths: List[str], skip_upload: bool = False):
+    async def process_edit(
+        self, prompt: str, video_paths: List[str], skip_upload: bool = False
+    ):
         """Main function to process the video edit request."""
-        clip_paths = []  # Initialize clip_paths at the start
-        
         if not skip_upload:
-            # 1. Upload videos
+            # 1. Upload videos asynchronously
             print("Uploading videos...")
-            for path in video_paths:
-                try:
-                    print(f"\nUploading {path}...")
-                    upload_video(path)
-                except Exception as e:
-                    print(f"Error uploading {path}: {str(e)}")
-                    continue
+            upload_tasks = [self.upload_video_async(path) for path in video_paths]
+            await asyncio.gather(*upload_tasks)
+
+            # Check for any upload errors
+            for path, metadata in self.video_metadata.items():
+                if metadata.status == VideoStatus.ERROR:
+                    print(f"Error uploading {path}: {metadata.error}")
 
         # 2. Analyze prompt
         print("\nAnalyzing prompt...")
-        search_terms, edit_type = self.analyze_prompt(prompt)
-        print(f"Search terms: {search_terms}")
-        print(f"Edit type: {edit_type}")
+        analysis = self.analyze_prompt(prompt)
+        print(f"Search queries: {analysis['search_queries']}")
+        print(f"Editing actions: {analysis['editing_actions']}")
+        print(f"Target videos: {analysis['target_videos']}")
 
-        # 3. Search for clips
+        # 3. Search for clips using Twelvelabs
         print("\nSearching for relevant clips...")
-        clips = self.processor.get_highest_scored_clips(search_terms)
+        clips = []
+        for query in analysis["search_queries"]:
+            # Run search_video in a thread pool since it's synchronous
+            search_results = await asyncio.to_thread(search_video, query)
+            clips.extend(search_results)
+
         if not clips:
             print("No relevant clips found.")
             return
@@ -192,41 +145,127 @@ class VideoEditor:
             print(f"Video ID: {clip['video_id']}")
             print(f"Time range: {clip['start_time']} - {clip['end_time']}")
             print(f"Score: {clip['score']}")
+            print(f"Thumbnail URL: {clip['thumbnail_url']}")
 
+            # Save clip to MongoDB
+            collection = db["metadata"]
+            collection.insert_one(
+                {
+                    "video_id": clip["video_id"],
+                    "start_time": clip["start_time"],
+                    "end_time": clip["end_time"],
+                    "score": clip["score"],
+                    "thumbnail_url": clip["thumbnail_url"],
+                }
+            )
+
+    def cleanup(self, clip_paths: List[str]):
+        """Clean up temporary files."""
         try:
-            # 4. Generate FFmpeg command and create clips
-            print("\nGenerating FFmpeg command and creating clips...")
-            ffmpeg_command, clip_paths = self.generate_ffmpeg_command(prompt, clips, edit_type)
-            print(f"Generated command: {ffmpeg_command}")
+            # Remove individual clips
+            for path in clip_paths:
+                if os.path.exists(path):
+                    os.remove(path)
 
-            # 5. Execute FFmpeg command
-            print("\nExecuting FFmpeg command...")
-            if self.execute_ffmpeg(ffmpeg_command, str(self.output_dir)):
-                print(f"Successfully created edited video")
-            else:
-                print("Failed to execute FFmpeg command.")
-                
+            # Remove concat file
+            concat_file = self.temp_dir / "concat_list.txt"
+            if concat_file.exists():
+                os.remove(concat_file)
+
         except Exception as e:
-            print(f"Error during processing: {str(e)}")
-        finally:
-            # Clean up temporary files
-            if clip_paths:  # Only clean up if we have clip paths
-                self.cleanup(clip_paths)
+            print(f"Error during cleanup: {str(e)}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Video Editor CLI Tool")
-    parser.add_argument("--prompt", required=True, help="Natural language prompt for video editing")
-    parser.add_argument("--videos", nargs="+", help="Paths to video files to process")
-    parser.add_argument("--skip-upload", action="store_true", help="Skip video upload and use already indexed videos")
-    
-    args = parser.parse_args()
-    
-    # Validate arguments
-    if not args.skip_upload and not args.videos:
-        parser.error("--videos is required when not using --skip-upload")
-    
+
+def clear_screen():
+    """Clear the terminal screen."""
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def print_header():
+    """Print the application header."""
+    print("\n" + "=" * 50)
+    print("Reduct AI Video Editor CLI Tool".center(50))
+    print("=" * 50 + "\n")
+
+
+def get_video_paths() -> List[str]:
+    """Get video paths from user input."""
+    paths = []
+    print("\nEnter video paths (one per line). Press Enter twice when done:")
+    print("Note: You can paste paths with spaces, no need for quotes")
+    while True:
+        path = input("> ").strip()
+        if not path:
+            break
+        # Remove any surrounding quotes if present
+        path = path.strip("\"'")
+        # Convert to absolute path
+        path = os.path.abspath(path)
+        if os.path.exists(path):
+            paths.append(path)
+        else:
+            print(f"Warning: File not found: {path}")
+            print("Please check if the path is correct and try again.")
+    return paths
+
+
+def get_edit_prompt() -> str:
+    """Get the editing prompt from user input."""
+    print("\nEnter your editing prompt:")
+    return input("> ").strip()
+
+
+def main_menu():
+    """Display the main menu and handle user interaction."""
     editor = VideoEditor()
-    editor.process_edit(args.prompt, args.videos if args.videos else [], args.skip_upload)
+
+    while True:
+        clear_screen()
+        print_header()
+        print("1. Upload and Edit Videos")
+        print("2. Edit Existing Videos")
+        print("3. Exit")
+
+        choice = input("\nSelect an option (1-3): ").strip()
+
+        if choice == "1":
+            # Upload and edit flow
+            video_paths = get_video_paths()
+            if not video_paths:
+                print("\nNo videos selected. Press Enter to continue...")
+                input()
+                continue
+
+            prompt = get_edit_prompt()
+            if not prompt:
+                print("\nNo prompt provided. Press Enter to continue...")
+                input()
+                continue
+
+            asyncio.run(editor.process_edit(prompt, video_paths, skip_upload=False))
+
+        elif choice == "2":
+            # Edit existing videos flow
+            prompt = get_edit_prompt()
+            if not prompt:
+                print("\nNo prompt provided. Press Enter to continue...")
+                input()
+                continue
+
+            asyncio.run(editor.process_edit(prompt, [], skip_upload=True))
+
+        elif choice == "3":
+            print("\nGoodbye!")
+            sys.exit(0)
+
+        else:
+            print("\nInvalid option. Press Enter to continue...")
+            input()
+            continue
+
+        print("\nPress Enter to continue...")
+        input()
+
 
 if __name__ == "__main__":
-    main()
+    main_menu()
