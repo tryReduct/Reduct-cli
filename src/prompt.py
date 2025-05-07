@@ -14,6 +14,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def generate_prompt(query: str, clip_data: List[Dict]) -> str:
+    original_filename = clip_data[0]['filename']
     prompt = f"""You are an expert AI assistant specializing in video editing automation. Your task is to translate a user's natural language video editing request into executable Python code using the `ffmpeg-python` library.
 
 **Context:**
