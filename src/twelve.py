@@ -44,8 +44,8 @@ def upload_video(video_path):
 def print_search_data(data: SearchData):
     return {
         'score': data.score,
-        'start': data.start,
-        'end': data.end,
+        'start_time': data.start,
+        'end_time': data.end,
         'video_id': data.video_id,
         'thumbnail_url': data.thumbnail_url
     }
@@ -88,27 +88,10 @@ def search_video(user_query):
     # Print results
     for clip in all_clips:
         print(f"\nClip Details:")
-        print(f"  Timestamp: {clip['start']} - {clip['end']}")
+        print(f"  Timestamp: {clip['start_time']} - {clip['end_time']}")
         print(f"  Score: {clip['score']}")
         print(f"  Thumbnail URL: {clip['thumbnail_url']}")
         print(f"  Video ID: {clip['video_id']}")
+    
+    return all_clips
 
-if __name__ == "__main__":
-    while True:
-        print("\nWelcome to Reduct\n")
-        print("1. Upload a video")
-        print("2. Search in your video library")
-        print("3. Exit")
-        choice = input("Enter your choice (1-3): ").strip()
-
-        if choice == "1":
-            input_path = input("Enter the path to the video: ")
-            upload_video(input_path)
-        elif choice == "2":
-            user_query = input("Enter your search query: ")
-            search_video(user_query)
-        elif choice == "3":
-            print("Goodbye!")
-            break
-        else:
-            print("Press Ctrl+C to exit.")
