@@ -77,7 +77,6 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
-.env
 .venv
 env/
 venv/
@@ -100,7 +99,6 @@ venv.bak/
 
 # IDE
 .idea/
-.vscode/
 *.swp
 *.swo
 
@@ -127,3 +125,5 @@ system_prompt.txt
 *.mp4
 
 src/src/edited/videos/
+config.bat
+node_modules
